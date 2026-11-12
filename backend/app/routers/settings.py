@@ -29,18 +29,10 @@ def put_setting(key: str, body: SettingUpdate):
 
 @router.get("/watermarks")
 def list_watermarks():
-    from app.repositories import sources as sources_repo
+    from app.modules import watermark_commit_gate
 
     conn = connect()
     try:
-        return [
-            {
-                "source_id": s["id"],
-                "name": s["name"],
-                "watermark_ts": s["watermark_ts"],
-                "lookback_seconds": s["lookback_seconds"],
-            }
-            for s in sources_repo.list_sources(conn)
-        ]
+        return watermark_commit_gate.watermark_status(conn)
     finally:
         conn.close()

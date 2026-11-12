@@ -7,8 +7,10 @@ from app.config import FIXTURES_DIR
 from app.db import connect
 from app.engines.merge_rules import decide_merge, eligible_for_incremental
 from app.engines.parse_feed import parse_fixture
+from app.modules import watermark_commit_gate
 from app.repositories import canonical as canon_repo
 from app.repositories import runs as runs_repo
+from app.repositories import settings as settings_repo
 from app.repositories import sources as sources_repo
 
 
@@ -41,9 +43,12 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
         if not source["enabled"]:
             raise ValueError("source disabled")
 
-        if mode == "full":
-            sources_repo.set_watermark(conn, source_id, None)
-            source["watermark_ts"] = None
+        # Snapshot pre-run state. The watermark is only ever written AFTER the
+        # commit gate passes; a full reload ignores the stored watermark for
+        # eligibility but must not clear it up front.
+        pre_run_watermark = source["watermark_ts"]
+        pre_run_canonical_count = canon_repo.count_items(conn)
+        eligibility_watermark = None if mode == "full" else pre_run_watermark
 
         run_id = runs_repo.create_run(conn, source_id, mode)
         path = FIXTURES_DIR / source["fixture_path"]
@@ -68,14 +73,14 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
         upserted = 0
         conflicts = 0
         skipped = 0
-        max_event_ts: str | None = source.get("watermark_ts")
+        max_event_ts: str | None = eligibility_watermark
         dispositions: list[str] = []
 
         for item in items:
             parsed += 1
             if mode == "incremental" and not eligible_for_incremental(
                 item["event_ts"],
-                source.get("watermark_ts"),
+                eligibility_watermark,
                 int(source.get("lookback_seconds") or 0),
             ):
                 runs_repo.insert_staging(
@@ -150,29 +155,75 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                 if max_event_ts is None or item["event_ts"] > max_event_ts:
                     max_event_ts = item["event_ts"]
 
-        if max_event_ts:
-            sources_repo.set_watermark(conn, source_id, max_event_ts)
+        counters = {
+            "parsed": parsed,
+            "upserted": upserted,
+            "conflicts": conflicts,
+            "skipped": skipped,
+        }
+        # Controlled fault injection (demo/chaos hook, settings-driven). Runs
+        # after processing and before the gate, simulating a pipeline fault
+        # that the commit gate must catch. 'off' in normal operation.
+        fault = settings_repo.get_all(conn).get(watermark_commit_gate.FAULT_SETTING_KEY, "off")
+        fault_note = watermark_commit_gate.inject_fault(
+            conn, fault=fault, run_id=run_id, counters=counters
+        )
 
-        canonical_count = canon_repo.count_items(conn)
+        candidate_watermark = max_event_ts
+        post_run_canonical_count = canon_repo.count_items(conn)
+
+        # Commit gate: reconcile this run's report against the persisted
+        # staging / conflicts / canonical tables BEFORE touching the watermark.
+        gate = watermark_commit_gate.evaluate(
+            conn,
+            run_id=run_id,
+            mode=mode,
+            parsed=counters["parsed"],
+            upserted=counters["upserted"],
+            conflicts=counters["conflicts"],
+            skipped=counters["skipped"],
+            pre_run_watermark_ts=pre_run_watermark,
+            candidate_watermark_ts=candidate_watermark,
+            pre_run_canonical_count=pre_run_canonical_count,
+            post_run_canonical_count=post_run_canonical_count,
+        )
+
+        if gate.passed:
+            if candidate_watermark:
+                sources_repo.set_watermark(conn, source_id, candidate_watermark)
+            committed_watermark = candidate_watermark if candidate_watermark else pre_run_watermark
+            status = "ok"
+        else:
+            # Gate failed: keep the pre-run watermark untouched so later
+            # increments are not based on an unreconciled position.
+            committed_watermark = pre_run_watermark
+            status = "gate_failed"
+
         report = {
             "source_id": source_id,
             "mode": mode,
-            "parsed_count": parsed,
-            "upserted_count": upserted,
-            "conflict_count": conflicts,
-            "skipped_count": skipped,
-            "canonical_count": canonical_count,
-            "watermark_ts": max_event_ts,
+            "parsed_count": counters["parsed"],
+            "upserted_count": counters["upserted"],
+            "conflict_count": counters["conflicts"],
+            "skipped_count": counters["skipped"],
+            "pre_run_canonical_count": pre_run_canonical_count,
+            "canonical_count": post_run_canonical_count,
+            "pre_run_watermark_ts": pre_run_watermark,
+            "candidate_watermark_ts": candidate_watermark,
+            "committed_watermark_ts": committed_watermark,
+            "watermark_committed": bool(gate.passed and candidate_watermark),
             "dispositions": dispositions,
+            "gate": gate.as_dict(),
+            "fault_injection": fault_note,
         }
         runs_repo.finish_run(
             conn,
             run_id,
-            status="ok",
-            parsed=parsed,
-            upserted=upserted,
-            conflicts=conflicts,
-            skipped=skipped,
+            status=status,
+            parsed=counters["parsed"],
+            upserted=counters["upserted"],
+            conflicts=counters["conflicts"],
+            skipped=counters["skipped"],
             report=report,
         )
         conn.commit()

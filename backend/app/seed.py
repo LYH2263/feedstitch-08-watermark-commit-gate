@@ -103,5 +103,6 @@ def init_db():
         )
         conn.execute("INSERT INTO settings(key, value) VALUES ('project_label', 'Feedstitch')")
         conn.execute("INSERT INTO settings(key, value) VALUES ('default_mode', 'incremental')")
+        conn.execute("INSERT INTO settings(key, value) VALUES ('gate_fault_injection', 'off')")
         conn.commit()
     conn.close()
